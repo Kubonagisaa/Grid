@@ -1,0 +1,1280 @@
+import time
+import math
+import json
+from datetime import datetime, timedelta
+import os
+from typing import List, Tuple, Dict, Optional, Any
+from collections import deque
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import asyncio
+from threading import Thread
+import logging
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+import ccxt.async_support as ccxt_async
+import ccxt
+import aiohttp
+import signal
+import sys
+import threading
+
+# Nếu cần chạy trong notebook hay môi trường có event loop sẵn, bật nest_asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+# ======== CÀI ĐẶT BAN ĐẦU ========
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('grid_trading_bot.log'),
+        logging.StreamHandler(),
+    ]
+)
+
+# File để lưu trạng thái bot
+STATE_FILE = "bot_state.json"
+
+# Lock để đồng bộ hóa đặt lệnh
+order_lock = asyncio.Lock()
+
+# ======== QUẢN LÝ CẤU HÌNH (Lấy từ .env) ========
+class AdvancedConfig:
+    def __init__(self):
+        self.enabled_exchanges: List[str] = os.getenv("ENABLED_EXCHANGES", "paper_trading").split(",")
+        self.exchange_credentials: Dict[str, Tuple[str, str]] = {
+            ex: (os.getenv(f"{ex.upper()}_API_KEY", "your_api_key"),
+                 os.getenv(f"{ex.upper()}_API_SECRET", "your_api_secret"))
+            for ex in self.enabled_exchanges
+        }
+        self.symbol: str = os.getenv("TRADING_SYMBOL", "BTCUSDT")
+        self.initial_investment: float = float(os.getenv("INITIAL_INVESTMENT", 20))
+        self.min_quantity: float = float(os.getenv("MIN_QUANTITY", 0.0005))
+        self.max_position: float = float(os.getenv("MAX_POSITION", 0.01))
+        self.base_stop_loss_percent: float = float(os.getenv("BASE_STOP_LOSS_PERCENT", 2.0))
+        self.base_take_profit_percent: float = float(os.getenv("BASE_TAKE_PROFIT_PERCENT", 2.0))
+        self.price_drop_threshold: float = float(os.getenv("PRICE_DROP_THRESHOLD", 1.0))
+        self.adaptive_grid_enabled: bool = os.getenv("ADAPTIVE_GRID_ENABLED", "True").lower() == "true"
+        self.min_grid_levels: int = int(os.getenv("MIN_GRID_LEVELS", 5))
+        self.max_grid_levels: int = int(os.getenv("MAX_GRID_LEVELS", 15))
+        self.base_grid_step_percent: float = float(os.getenv("BASE_GRID_STEP_PERCENT", 2.0))
+        self.grid_rebalance_interval: int = int(os.getenv("GRID_REBALANCE_INTERVAL", 300))
+        self.trailing_stop_enabled: bool = os.getenv("TRAILING_STOP_ENABLED", "True").lower() == "true"
+        self.trailing_up_activation: float = float(os.getenv("TRAILING_UP_ACTIVATION", 90000))
+        self.trailing_down_activation: float = float(os.getenv("TRAILING_DOWN_ACTIVATION", 80000))
+        self.trailing_tp_enabled: bool = os.getenv("TRAILING_TP_ENABLED", "True").lower() == "true"
+        self.trailing_buy_stop_enabled: bool = os.getenv("TRAILING_BUY_STOP_ENABLED", "True").lower() == "true"
+        self.trailing_buy_activation_percent: float = float(os.getenv("TRAILING_BUY_ACTIVATION_PERCENT", 1.5))
+        self.trailing_buy_distance_percent: float = float(os.getenv("TRAILING_BUY_DISTANCE_PERCENT", 1.0))
+        self.pump_protection_threshold: float = float(os.getenv("PUMP_PROTECTION_THRESHOLD", 0.03))
+        self.circuit_breaker_threshold: float = float(os.getenv("CIRCUIT_BREAKER_THRESHOLD", 0.07))
+        self.circuit_breaker_duration: int = int(os.getenv("CIRCUIT_BREAKER_DURATION", 360))
+        self.abnormal_activity_threshold: float = float(os.getenv("ABNORMAL_ACTIVITY_THRESHOLD", 3.0))
+        self.maker_fee: float = float(os.getenv("MAKER_FEE", 0.0002))
+        self.taker_fee: float = float(os.getenv("TAKER_FEE", 0.0004))
+        self.telegram_enabled: bool = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+        self.telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
+        self.api_retry_count: int = int(os.getenv("API_RETRY_COUNT", 3))
+        self.api_retry_delay: int = int(os.getenv("API_RETRY_DELAY", 5))
+        self.max_open_orders: int = int(os.getenv("MAX_OPEN_ORDERS", 50))
+        self.status_update_interval: int = int(os.getenv("STATUS_UPDATE_INTERVAL", 1800))
+        self.volatility_window: int = int(os.getenv("VOLATILITY_WINDOW", 200))
+        self.ma_short_period: int = int(os.getenv("MA_SHORT_PERIOD", 20))
+        self.ma_long_period: int = int(os.getenv("MA_LONG_PERIOD", 50))
+        self.atr_period: int = int(os.getenv("ATR_PERIOD", 14))
+        self.rsi_period: int = int(os.getenv("RSI_PERIOD", 14))
+        self.bb_period: int = int(os.getenv("BB_PERIOD", 20))
+        self.bb_std_dev: float = float(os.getenv("BB_STD_DEV", 1.8))
+        self.min_acceptable_volume: float = float(os.getenv("MIN_ACCEPTABLE_VOLUME", 100))
+        self.fee_threshold: float = float(os.getenv("FEE_THRESHOLD", 0.1))
+        self.websocket_enabled: bool = os.getenv("WEBSOCKET_ENABLED", "False").lower() == "true"
+        self.websocket_reconnect_interval: int = int(os.getenv("WEBSOCKET_RECONNECT_INTERVAL", 60))
+        self.order_cooldown_sec: int = int(os.getenv("ORDER_COOLDOWN_SECONDS", 180))
+        self.paper_trading_enabled: bool = os.getenv("PAPER_TRADING", "False").lower() == "true"
+        self.live_paper_trading: bool = os.getenv("LIVE_PAPER_TRADING", "False").lower() == "true"
+        self.dashboard_username: str = os.getenv("DASHBOARD_USERNAME", "admin")
+        self.dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "admin123")
+        self.strategy_mode: int = int(os.getenv("STRATEGY_MODE", 1))
+        self.wide_grid_step_percent_min: float = float(os.getenv("WIDE_GRID_STEP_PERCENT_MIN", 2.0))
+        self.wide_grid_step_percent_max: float = float(os.getenv("WIDE_GRID_STEP_PERCENT_MAX", 3.0))
+        self.dense_grid_step_percent_min: float = float(os.getenv("DENSE_GRID_STEP_PERCENT_MIN", 0.5))
+        self.dense_grid_step_percent_max: float = float(os.getenv("DENSE_GRID_STEP_PERCENT_MAX", 1.0))
+        self.capital_reserve_percent: float = float(os.getenv("CAPITAL_RESERVE_PERCENT", 0.0))
+        self.min_profit_percent: float = float(os.getenv("MIN_PROFIT_PERCENT", 0.0))
+        self.stop_loss_capital_percent: float = float(os.getenv("STOP_LOSS_CAPITAL_PERCENT", 30.0))
+        self.backtest_enabled: bool = os.getenv("BACKTEST_ENABLED", "False").lower() == "true"
+        self.backtest_timeframe: str = os.getenv("BACKTEST_TIMEFRAME", "1h")
+        self.backtest_limit: int = int(os.getenv("BACKTEST_LIMIT", 1000))
+        self.telegram_report_interval: int = int(os.getenv("TELEGRAM_REPORT_INTERVAL", 3600))
+        self.telegram_volatile_interval: int = int(os.getenv("TELEGRAM_VOLATILE_INTERVAL", 600))
+        self.telegram_volatility_threshold: float = float(os.getenv("TELEGRAM_VOLATILITY_THRESHOLD", 1.0))
+        if self.strategy_mode == 1:
+            self.base_grid_step_percent = self.wide_grid_step_percent_min
+        elif self.strategy_mode == 2:
+            self.base_grid_step_percent = self.dense_grid_step_percent_min
+        if "DOGE" in self.symbol:
+            self.trailing_up_activation = float(os.getenv("TRAILING_UP_ACTIVATION_DOGE", 0.0))
+            self.trailing_down_activation = float(os.getenv("TRAILING_DOWN_ACTIVATION_DOGE", 0.0))
+
+config = AdvancedConfig()
+
+logging.info(f"Đã chọn chiến lược {config.strategy_mode}: {'Grid thưa (bước ~2-3%, có RSI)' if config.strategy_mode == 1 else 'Grid dày (bước ~0.5%, không dùng RSI)'}")
+logging.info(f"Bước lưới cơ bản: {config.base_grid_step_percent:.2f}%, Mức grid tối thiểu: {config.min_grid_levels}, tối đa: {config.max_grid_levels}")
+
+# ======== HÀM TIỆN ÍCH ========
+def calculate_atr(highs: List[float], lows: List[float], prices: List[float], period: int) -> float:
+    if len(highs) < period or len(lows) < period or len(prices) < period:
+        return 0.0
+    tr_values = []
+    for i in range(1, len(prices)):
+        high = highs[i]
+        low = lows[i]
+        prev_close = prices[i-1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_values.append(tr)
+    atr = sum(tr_values[-period:]) / period if len(tr_values) >= period else 0.0
+    return atr
+
+def calculate_rsi(prices: List[float], period: int) -> float:
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = np.diff(prices)
+    ups = deltas.clip(min=0)
+    downs = -1 * deltas.clip(max=0)
+    avg_gain = np.mean(ups[-period:]) if len(ups) >= period else 0
+    avg_loss = np.mean(downs[-period:]) if len(downs) >= period else 0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+def calculate_max_drawdown(equity_curve: List[float]) -> float:
+    if not equity_curve:
+        return 0.0
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for value in equity_curve:
+        peak = max(peak, value)
+        drawdown = (peak - value) / peak if peak > 0 else 0
+        max_dd = max(max_dd, drawdown)
+    return max_dd * 100
+
+def auto_adjust_rsi_thresholds(prices: List[float], default_low=30, default_high=70) -> Tuple[float, float]:
+    rsi = calculate_rsi(prices, config.rsi_period)
+    if rsi < 40:
+        return (25, 65)
+    elif rsi > 60:
+        return (35, 75)
+    else:
+        return (default_low, default_high)
+
+# ======== KIỂM TRA KẾT NỐI INTERNET ========
+async def check_internet_connection() -> bool:
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get("https://www.google.com", timeout=aiohttp.ClientTimeout(total=5)) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+# ======== HỆ THỐNG BẢO VỆ NÂNG CAO ========
+class EnhancedProtectionSystem:
+    def __init__(self):
+        self.price_history: deque = deque(maxlen=config.volatility_window)
+        self.high_history: deque = deque(maxlen=config.volatility_window)
+        self.low_history: deque = deque(maxlen=config.volatility_window)
+        self.volume_history: deque = deque(maxlen=config.volatility_window)
+        self.trailing_stop_price: float = 0.0
+        self.trailing_buy_price: float = 0.0
+        self.circuit_breaker_triggered: bool = False
+        self.circuit_breaker_start: Optional[float] = None
+
+    def update(self, price: float, high: float, low: float, volume: float) -> None:
+        if price <= 0 or high <= 0 or low <= 0 or volume < 0:
+            logging.warning(f"Dữ liệu không hợp lệ: price={price}, high={high}, low={low}, volume={volume}")
+            return
+        self.price_history.append(price)
+        self.high_history.append(high)
+        self.low_history.append(low)
+        self.volume_history.append(volume)
+
+    def check_pump_protection(self, price: float) -> bool:
+        if len(self.price_history) < 2:
+            return False
+        price_change = (price - self.price_history[-2]) / self.price_history[-2]
+        return price_change > config.pump_protection_threshold
+
+    async def check_circuit_breaker(self, price: float) -> bool:
+        if len(self.price_history) < 2:
+            return False
+        price_change = abs(price - self.price_history[-2]) / self.price_history[-2]
+        if price_change > config.circuit_breaker_threshold:
+            self.circuit_breaker_triggered = True
+            self.circuit_breaker_start = time.time()
+            logging.warning(f"Ngắt mạch được kích hoạt: Giá thay đổi {price_change:.2%}")
+            await send_telegram_alert("Circuit breaker: biên độ giá quá lớn, tạm dừng giao dịch")
+            return True
+        return False
+
+    async def check_circuit_breaker_status(self) -> bool:
+        if self.circuit_breaker_triggered and self.circuit_breaker_start:
+            elapsed = time.time() - self.circuit_breaker_start
+            if elapsed > config.circuit_breaker_duration:
+                self.circuit_breaker_triggered = False
+                self.circuit_breaker_start = None
+                logging.info("Ngắt mạch đã được đặt lại")
+                await send_telegram_alert("Circuit breaker đã được đặt lại")
+                return False
+            return True
+        return False
+
+    def check_abnormal_activity(self, volume: float) -> bool:
+        if len(self.volume_history) < 2:
+            return False
+        avg_volume = np.mean(list(self.volume_history)[:-1])
+        return volume > avg_volume * config.abnormal_activity_threshold
+
+    def update_trailing_stop(self, price: float) -> Tuple[bool, float]:
+        if not config.trailing_stop_enabled:
+            return False, self.trailing_stop_price
+        if price > self.trailing_stop_price and price > config.trailing_up_activation:
+            self.trailing_stop_price = price * (1 - config.base_stop_loss_percent / 100)
+        elif price < self.trailing_stop_price and price < config.trailing_down_activation:
+            self.trailing_stop_price = price * (1 + config.base_stop_loss_percent / 100)
+        should_stop = price <= self.trailing_stop_price
+        return should_stop, self.trailing_stop_price
+
+    def update_trailing_buy(self, price: float) -> Tuple[bool, float]:
+        if not config.trailing_buy_stop_enabled:
+            return False, self.trailing_buy_price
+        if price < self.trailing_buy_price or self.trailing_buy_price == 0:
+            self.trailing_buy_price = price * (1 + config.trailing_buy_activation_percent / 100)
+        should_buy = price >= self.trailing_buy_price * (1 + config.trailing_buy_distance_percent / 100)
+        return should_buy, self.trailing_buy_price
+
+# ======== QUẢN LỆNH NÂNG CAO ========
+class EnhancedOrderManager:
+    def __init__(self):
+        self.open_orders: List[Dict] = []
+        self.is_paused: bool = False
+        self.completed_orders: List[Dict] = []
+
+    async def cancel_all_orders(self, exchange: 'ExchangeInterface') -> None:
+        try:
+            open_orders = await safe_api_call(exchange.get_open_orders)
+            for order in open_orders:
+                if 'orderId' not in order:
+                    logging.warning(f"Lệnh không có orderId: {order}")
+                    continue
+                await safe_api_call(exchange.cancel_order, order['orderId'])
+            self.open_orders.clear()
+            logging.info("Đã hủy tất cả lệnh mở")
+        except Exception as e:
+            logging.error(f"Lỗi khi hủy tất cả lệnh: {str(e)}")
+
+    async def check_and_handle_orders(self, current_price: float, exchange: 'ExchangeInterface', profit_tracker: 'EnhancedProfitTracker', grid_manager: 'EnhancedSmartGridManager') -> None:
+        try:
+            orders = await safe_api_call(exchange.get_all_orders)
+            for order in orders:
+                if 'orderId' not in order:
+                    continue
+                if order['status'] == 'FILLED':
+                    side = order['side']
+                    try:
+                        price = float(order['price']) if order['price'] is not None else 0.0
+                        qty = float(order['executedQty']) if order['executedQty'] is not None else 0.0
+                    except (ValueError, TypeError) as e:
+                        logging.error(f"Giá hoặc số lượng không hợp lệ trong lệnh {order['orderId']}: {str(e)}")
+                        continue
+                    if price <= 0 or qty <= 0:
+                        logging.warning(f"Giá hoặc số lượng không hợp lệ trong lệnh {order['orderId']}: price={price}, qty={qty}")
+                        continue
+                    if order['orderId'] in grid_manager.static_order_ids and side.upper() == 'BUY':
+                        grid_manager.trailing_stops[("BUY", round(price, grid_manager.price_precision))] = [price, qty]
+                        logging.info(f"Đã thực hiện mua tĩnh: Giá {price:.2f}, SL {qty:.6f}")
+                        continue
+                    if side.upper() == 'SELL':
+                        profit = (price - (price * (1 + config.base_stop_loss_percent/100))) * qty - (price * qty * config.taker_fee)
+                    else:
+                        profit = (price * (1 - config.base_take_profit_percent/100) - price) * qty - (price * qty * config.taker_fee)
+                    self.completed_orders.append({"side": side.upper(), "price": price, "quantity": qty, "profit": profit})
+                    profit_tracker.record_trade(profit, price * qty * config.taker_fee)
+                    if config.live_paper_trading:
+                        msg = f"Lệnh {side.upper()} đã được hoàn thành:\nGiá: {price:.2f}\nSL: {qty:.6f}\nLợi nhuận: {profit:.2f} USDT"
+                        logging.info(msg)
+                        await send_telegram_alert(msg)
+            else:
+                return
+        except Exception as e:
+            logging.error(f"Lỗi khi xử lý lệnh: {str(e)}")
+
+# ======== HỆ THỐNG ĐỆ QUY LỢI NHUẬN NÂNG CAO ========
+@dataclass
+class MarketData:
+    price: float
+    high: float
+    low: float
+    volume: float
+
+class EnhancedProfitTracker:
+    def __init__(self):
+        self.total_profit: float = 0.0
+        self.trade_count: int = 0
+
+    def record_trade(self, profit: float, fee: float) -> None:
+        self.total_profit += (profit - fee)
+        self.trade_count += 1
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "total_profit": self.total_profit,
+            "trade_count": self.trade_count
+        }
+
+class EnhancedSmartGridManager:
+    def __init__(self):
+        self.grid_levels: List[Tuple[float, float]] = []
+        self.static_levels: int = 3
+        self.static_orders_placed: bool = False
+        self.static_order_ids: List[str] = []
+        self.order_ids: List[str] = []
+        self.trailing_stops: Dict[Tuple[str, float], List[float]] = {}
+        self.grid_cooldown: Dict[Tuple[str, float], float] = {}
+        self.price_precision: int = 2
+        self.FALLBACK_COOLDOWN: int = 300
+        self.price_history: deque = deque(maxlen=config.volatility_window)
+        self.high_history: deque = deque(maxlen=config.volatility_window)
+        self.low_history: deque = deque(maxlen=config.volatility_window)
+        self.last_static_order_time: float = 0.0
+        self.last_fallback_time: float = 0.0
+
+    async def calculate_adaptive_grid(self, current_price: float, exchange: Optional['ExchangeInterface'] = None) -> None:
+        if not isinstance(current_price, (int, float)) or current_price <= 0:
+            logging.warning(f"Giá hiện tại không hợp lệ: {current_price}")
+            return
+
+        self.price_history.append(current_price)
+        if not config.adaptive_grid_enabled or len(self.price_history) < config.volatility_window:
+            self.grid_levels = self._create_static_grid(current_price)
+            return
+
+        atr = calculate_atr(list(self.high_history), list(self.low_history), list(self.price_history), config.atr_period)
+        atr = atr or current_price * 0.001
+        volatility = min(atr / current_price, 0.1)
+        num_levels = max(config.min_grid_levels, min(config.max_grid_levels, int(volatility / (config.base_grid_step_percent / 100))))
+        raw_step = volatility / num_levels if num_levels > 0 else (config.base_grid_step_percent / 100)
+        if config.strategy_mode == 1:
+            step_percent = max(config.wide_grid_step_percent_min / 100, min(config.wide_grid_step_percent_max / 100, raw_step))
+        else:
+            step_percent = max(config.dense_grid_step_percent_min / 100, min(config.dense_grid_step_percent_max / 100, raw_step))
+
+        self.grid_levels = []
+        max_distance = 0.05
+        for i in range(num_levels):
+            buy_price = current_price * (1 - step_percent * (i + 1))
+            sell_price = current_price * (1 + step_percent * (i + 1))
+            if buy_price <= 0 or sell_price <= 0:
+                continue
+            if abs(buy_price - current_price) / current_price > max_distance or abs(sell_price - current_price) / current_price > max_distance:
+                continue
+            self.grid_levels.append((buy_price, sell_price))
+        logging.info(f"Grid thích ứng: {len(self.grid_levels)} mức, bước {step_percent:.2%}")
+
+    def _create_static_grid(self, current_price: float) -> List[Tuple[float, float]]:
+        grid = []
+        step_percent = config.base_grid_step_percent / 100
+        for i in range(max(self.static_levels, config.min_grid_levels)):
+            buy_price = current_price * (1 - step_percent * (i + 1))
+            sell_price = current_price * (1 + step_percent * (i + 1))
+            if buy_price <= 0 or sell_price <= 0:
+                continue
+            if abs(buy_price - current_price) / current_price > 0.05 or abs(sell_price - current_price) / current_price > 0.05:
+                continue
+            grid.append((buy_price, sell_price))
+        return grid
+
+    def duplicate_order_exists(self, side: str, price: float, open_orders: List[Dict]) -> bool:
+        target = round(price, self.price_precision)
+        for order in open_orders:
+            if 'price' not in order or order['price'] is None:
+                continue
+            order_price = round(float(order['price']), self.price_precision)
+            if order['side'].upper() == side.upper() and order_price == target:
+                return True
+        return False
+
+    async def place_static_orders(self, current_price: float, exchange: 'ExchangeInterface') -> None:
+        if config.strategy_mode == 2:
+            logging.info("Chế độ 2: Bỏ qua đặt lệnh static.")
+            return
+        current_time = time.time()
+        last_time = getattr(self, 'last_static_order_time', 0)
+        if current_time - last_time < config.order_cooldown_sec:
+            wait = config.order_cooldown_sec - (current_time - last_time)
+            logging.info(f"Chưa hết cooldown (còn {wait:.1f}s) cho lệnh static")
+            return
+
+        rsi_val = calculate_rsi(list(self.price_history), config.rsi_period) if len(self.price_history) >= config.rsi_period else 50.0
+        if not (40 <= rsi_val <= 60):
+            logging.info(f"Thị trường không ổn định (RSI={rsi_val:.2f}), bỏ qua lệnh static")
+            return
+
+        if self.static_orders_placed:
+            logging.info("Lệnh static đã được đặt, bỏ qua")
+            return
+
+        async with order_lock:
+            try:
+                open_orders = await safe_api_call(exchange.get_open_orders)
+            except Exception as e:
+                logging.error(f"Lỗi khi lấy lệnh mở: {str(e)}")
+                open_orders = []
+            filters = await exchange.get_symbol_filters()
+            num_levels = self.static_levels
+            usdt_balance, _ = await safe_api_call(exchange.get_balance)
+            allocated_funds_per_order = (usdt_balance * (1 - config.capital_reserve_percent / 100)) / (2 * num_levels)
+            quantity_per_level = allocated_funds_per_order / current_price if current_price > 0 else 0.0
+            quantity = max(filters['minQty'], quantity_per_level)
+            quantity = min(quantity, filters['maxQty'])
+            step_size = filters.get('stepSize', 0.00001)
+            if step_size <= 0:
+                step_size = 0.00001
+            quantity = round(quantity - (quantity % step_size), 6)
+            if quantity < filters['minQty'] or quantity > filters['maxQty']:
+                logging.warning(f"Số lượng không hợp lệ: {quantity}")
+                await send_telegram_alert(f"Số lượng không hợp lệ: {quantity}")
+                return
+
+            static_grid = self._create_static_grid(current_price)[:num_levels]
+            for buy_price, sell_price in static_grid:
+                try:
+                    if buy_price <= 0 or sell_price <= 0:
+                        continue
+                    profit_percent = (sell_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+                    if profit_percent < config.min_profit_percent:
+                        continue
+                    if usdt_balance < buy_price * quantity:
+                        logging.warning("USDT không đủ để đặt lệnh MUA tĩnh, dừng đặt lệnh tiếp theo")
+                        break
+                    if not self.duplicate_order_exists("BUY", buy_price, open_orders):
+                        buy_order = await safe_api_call(
+                            exchange.place_order,
+                            side='BUY',
+                            order_type='LIMIT',
+                            quantity=quantity,
+                            price=buy_price
+                        )
+                        if 'orderId' not in buy_order:
+                            continue
+                        self.order_ids.append(buy_order['orderId'])
+                        self.static_order_ids.append(buy_order['orderId'])
+                        logging.info(f"(Static) Đã đặt lệnh MUA tại {buy_price:.2f}, SL: {quantity:.6f}")
+                except Exception as e:
+                    logging.error(f"(Static) Lỗi khi đặt lệnh: {str(e)}")
+                    await send_telegram_alert(f"(Static) Lỗi khi đặt lệnh: {str(e)}")
+            self.static_orders_placed = True
+            self.last_static_order_time = current_time
+            logging.info("Đã hoàn tất đặt lệnh static")
+
+    async def place_grid_orders(self, current_price: float, exchange: 'ExchangeInterface') -> None:
+        async with order_lock:
+            try:
+                open_orders = await safe_api_call(exchange.get_open_orders)
+            except Exception as e:
+                logging.error(f"Lỗi khi lấy lệnh mở: {str(e)}")
+                open_orders = []
+            filters = await exchange.get_symbol_filters()
+            num_levels = len(self.grid_levels)
+            if num_levels == 0:
+                logging.warning("Không có mức grid nào được tính toán")
+                return
+            usdt_balance, coin_balance = await safe_api_call(exchange.get_balance)
+            allocated_funds_per_order = (usdt_balance * (1 - config.capital_reserve_percent / 100)) / (2 * num_levels)
+            quantity_per_level = allocated_funds_per_order / current_price if current_price > 0 else 0.0
+            quantity = max(filters['minQty'], quantity_per_level)
+            quantity = min(quantity, filters['maxQty'])
+            step_size = filters.get('stepSize', 0.00001)
+            if step_size <= 0:
+                step_size = 0.00001
+            quantity = round(quantity - (quantity % step_size), 6)
+            if quantity < filters['minQty'] or quantity > filters['maxQty']:
+                logging.warning(f"Số lượng không hợp lệ: {quantity}")
+                await send_telegram_alert(f"Số lượng không hợp lệ: {quantity}")
+                return
+
+            open_count = len(open_orders)
+            current_time = time.time()
+
+            for i, (buy_price, sell_price) in enumerate(self.grid_levels[self.static_levels:], start=self.static_levels):
+                usdt_balance, coin_balance = await safe_api_call(exchange.get_balance)
+                profit_percent = (sell_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+                if profit_percent < config.min_profit_percent:
+                    continue
+                try:
+                    if buy_price <= 0 or sell_price <= 0:
+                        continue
+                    if buy_price < current_price:
+                        price_key = ("BUY", round(buy_price, self.price_precision))
+                        if current_time < self.grid_cooldown.get(price_key, 0):
+                            continue
+                        if usdt_balance < buy_price * quantity:
+                            logging.warning("USDT không đủ để đặt lệnh MUA, dừng vòng lặp đặt lệnh")
+                            break
+                        if not self.duplicate_order_exists("BUY", buy_price, open_orders):
+                            buy_order = await safe_api_call(
+                                exchange.place_order,
+                                side='BUY',
+                                order_type='LIMIT',
+                                quantity=quantity,
+                                price=buy_price
+                            )
+                            if 'orderId' not in buy_order:
+                                continue
+                            self.order_ids.append(buy_order['orderId'])
+                            open_count += 1
+                            logging.info(f"(Dynamic) Đã đặt lệnh MUA tại {buy_price:.2f}, SL: {quantity:.6f}")
+                    if sell_price > current_price:
+                        price_key = ("SELL", round(sell_price, self.price_precision))
+                        if current_time < self.grid_cooldown.get(price_key, 0):
+                            continue
+                        if not self.duplicate_order_exists("SELL", sell_price, open_orders):
+                            if config.max_open_orders and open_count >= config.max_open_orders:
+                                logging.warning(f"Đạt giới hạn lệnh tối đa ({open_count}/{config.max_open_orders})")
+                                break
+                            if coin_balance < quantity:
+                                logging.warning("Số dư coin không đủ để đặt lệnh BÁN")
+                                continue
+                            sell_order = await safe_api_call(
+                                exchange.place_order,
+                                side='SELL',
+                                order_type='LIMIT',
+                                quantity=quantity,
+                                price=sell_price
+                            )
+                            if 'orderId' not in sell_order:
+                                continue
+                            self.order_ids.append(sell_order['orderId'])
+                            open_count += 1
+                            logging.info(f"(Dynamic) Đã đặt lệnh BÁN tại {sell_price:.2f}, SL: {quantity:.6f}")
+                except Exception as e:
+                    logging.error(f"(Dynamic) Lỗi khi đặt lệnh: {str(e)}")
+                    await send_telegram_alert(f"(Dynamic) Lỗi khi đặt lệnh: {str(e)}")
+
+            has_buy_order = any(o['side'].upper() == 'BUY' for o in open_orders)
+            if not has_buy_order and len([o for o in open_orders if o['side'].upper() == 'BUY']) < 2 and current_time - self.last_fallback_time > self.FALLBACK_COOLDOWN:
+                buy_price = current_price * (1 - config.base_grid_step_percent / 200)
+                if buy_price > 0 and not self.duplicate_order_exists("BUY", buy_price, open_orders):
+                    buy_order = await safe_api_call(
+                        exchange.place_order,
+                        side='BUY',
+                        order_type='LIMIT',
+                        quantity=quantity,
+                        price=buy_price
+                    )
+                    if 'orderId' in buy_order:
+                        self.order_ids.append(buy_order['orderId'])
+                        self.last_fallback_time = current_time
+                        logging.info(f"(Fallback) Đã đặt lệnh MUA tại {buy_price:.2f}, SL: {quantity:.6f}")
+
+    async def cancel_all_orders(self, exchange: 'ExchangeInterface', preserve_static: bool = True) -> None:
+        async with order_lock:
+            orders_to_cancel = self.order_ids.copy()
+            if preserve_static:
+                orders_to_cancel = [oid for oid in orders_to_cancel if oid not in self.static_order_ids]
+            for order_id in orders_to_cancel:
+                try:
+                    await safe_api_call(exchange.cancel_order, order_id)
+                    if order_id in self.order_ids:
+                        self.order_ids.remove(order_id)
+                except Exception as e:
+                    logging.warning(f"Lỗi khi hủy lệnh {order_id}: {str(e)}")
+            if not preserve_static:
+                self.order_ids.clear()
+                self.static_order_ids.clear()
+                self.static_orders_placed = False
+
+    def set_cooldown(self, side: str, price: float):
+        key = (side.upper(), round(price, self.price_precision))
+        self.grid_cooldown[key] = time.time() + config.order_cooldown_sec
+        logging.info(f"Đặt cooldown cho {key} đến {self.grid_cooldown[key]:.2f}")
+
+    def get_grid_range(self) -> Tuple[Optional[float], Optional[float]]:
+        if not self.grid_levels:
+            return None, None
+        lows = [l for l, _ in self.grid_levels]
+        highs = [h for _, h in self.grid_levels]
+        return (min(lows) if lows else None, max(highs) if highs else None)
+
+    def _price_out_of_grid(self, current_price: float) -> bool:
+        low_grid, high_grid = self.get_grid_range()
+        return ((low_grid is not None and current_price < low_grid) or
+                (high_grid is not None and current_price > high_grid))
+
+    def update_trailing_stop_for_level(self, grid_level: Tuple[float, float], current_price: float) -> float:
+        _, sell_price = grid_level
+        key = ("SELL", round(sell_price, self.price_precision))
+        if key not in self.trailing_stops:
+            return None
+        highest_price, quantity = self.trailing_stops[key]
+        if current_price > highest_price:
+            self.trailing_stops[("SELL", round(sell_price, self.price_precision))][0] = current_price
+            highest_price = current_price
+        target_price = sell_price
+        if current_price <= target_price:
+            self.trailing_stops.pop(key, None)
+            logging.info(f"Trailing sell triggered for level {grid_level}")
+            return target_price
+        return None
+
+    async def rebalance_if_needed(self, current_price: float, exchange: 'ExchangeInterface') -> None:
+        if not self.grid_levels or not current_price:
+            return
+        current_time = time.time()
+        if current_time - getattr(self, 'last_rebalance_time', 0) < config.grid_rebalance_interval:
+            return
+        if self._price_out_of_grid(current_price):
+            logging.info("Giá vượt ngoài phạm vi lưới, bắt đầu tái cân bằng")
+            await self.cancel_all_orders(exchange)
+            await self.calculate_adaptive_grid(current_price, exchange)
+            await self.place_grid_orders(current_price, exchange)
+            self.last_rebalance_time = current_time
+            await send_telegram_alert("Đã tái cân bằng lưới do giá vượt phạm vi")
+
+@dataclass
+class TradeSignal:
+    side: str
+    price: float
+    quantity: float
+
+class GridStrategy(ABC):
+    def __init__(self, grid_manager: EnhancedSmartGridManager):
+        self.grid_manager = grid_manager
+
+    @abstractmethod
+    async def generate_signals(self, data: MarketData) -> List[TradeSignal]:
+        pass
+
+class AdaptiveGridStrategy(GridStrategy):
+    async def generate_signals(self, data: MarketData) -> List[TradeSignal]:
+        signals = []
+        rsi = calculate_rsi(list(self.grid_manager.price_history), config.rsi_period) if len(self.grid_manager.price_history) >= config.rsi_period else 50.0
+        rsi_low, rsi_high = auto_adjust_rsi_thresholds(list(self.grid_manager.price_history))
+        if rsi < rsi_low:
+            signals.append(TradeSignal(side="BUY", price=data.price * 0.999, quantity=config.min_quantity))
+        elif rsi > rsi_high:
+            signals.append(TradeSignal(side="SELL", price=data.price * 1.001, quantity=config.min_quantity))
+        low_grid, high_grid = self.grid_manager.get_grid_range()
+        if low_grid and data.price < low_grid:
+            signals.append(TradeSignal(side="BUY", price=data.price, quantity=config.min_quantity))
+        if high_grid and data.price > high_grid:
+            signals.append(TradeSignal(side="SELL", price=data.price, quantity=config.min_quantity))
+        return signals
+
+class DenseGridStrategy(GridStrategy):
+    async def generate_signals(self, data: MarketData) -> List[TradeSignal]:
+        signals = []
+        return signals
+
+# ======== BOT STATE ========
+class BotState:
+    def __init__(self, exchange: 'ExchangeInterface', strategy: GridStrategy):
+        self.exchange: 'ExchangeInterface' = exchange
+        self.exchange_name: str = exchange.exchange_name
+        self.tracker: EnhancedProfitTracker = EnhancedProfitTracker()
+        self.protection: EnhancedProtectionSystem = EnhancedProtectionSystem()
+        self.current_price: float = 0.0
+        self.current_volume: float = 0.0
+        self.current_high: float = 0.0
+        self.current_low: float = 0.0
+        self.grid_manager: EnhancedSmartGridManager = EnhancedSmartGridManager()
+        self.order_manager: EnhancedOrderManager = EnhancedOrderManager()
+        self.strategy: GridStrategy = strategy
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.last_price_update: float = 0.0
+        self.live_paper_trading: bool = config.live_paper_trading and self.exchange_name == "paper_trading"
+        self.last_report_time = time.time()
+
+    async def process_events(self) -> None:
+        start_time = time.time()
+        current_time = time.time()
+
+        if current_time - self.last_price_update >= 5:
+            if not await check_internet_connection():
+                logging.warning("Không có kết nối Internet, sử dụng giá trị gần nhất")
+                logging.warning(f"Sử dụng giá trị gần nhất để tiếp tục: price={self.current_price}, volume={self.current_volume}, high={self.current_high}, low={self.current_low}")
+            else:
+                new_price = None
+                new_volume = None
+                new_high_low = None
+                for attempt in range(config.api_retry_count):
+                    try:
+                        async with asyncio.timeout(20):
+                            new_price = await self.exchange.get_price()
+                            new_volume = await self.exchange.get_volume()
+                            new_high_low = await self.exchange.get_high_low()
+                            self.current_price = new_price
+                            self.current_volume = new_volume
+                            self.current_high, self.current_low = new_high_low
+                            self.last_price_update = current_time
+                            logging.info(f"Lấy dữ liệu thị trường thành công tại lần thử {attempt + 1}")
+                            break
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Lần thử {attempt + 1}/{config.api_retry_count} hết thời gian")
+                        if attempt < config.api_retry_count - 1:
+                            await asyncio.sleep(config.api_retry_delay)
+                    except Exception as e:
+                        logging.error(f"Lần thử {attempt + 1}/{config.api_retry_count} lỗi: {str(e)}")
+                        if attempt < config.api_retry_count - 1:
+                            await asyncio.sleep(config.api_retry_delay)
+                else:
+                    logging.error("Không thể lấy dữ liệu thị trường sau tất cả các lần thử")
+                    error_msg = (
+                        "⚠️ Không thể lấy dữ liệu thị trường sau nhiều lần thử\n"
+                        f"Thời gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"Giá cuối cùng: {self.current_price:.2f}\n"
+                        f"Khối lượng cuối cùng: {self.current_volume:.2f}\n"
+                        "Bot sẽ tiếp tục với dữ liệu cũ"
+                    )
+                    await send_telegram_alert(error_msg)
+                    logging.warning(f"Sử dụng giá trị gần nhất để tiếp tục: price={self.current_price}, volume={self.current_volume}, high={self.current_high}, low={self.current_low}")
+
+        self.protection.update(self.current_price, self.current_high, self.current_low, self.current_volume)
+        if await check_protections(self, self.exchange, self.current_price, self.current_volume, self.current_high, self.current_low):
+            return
+
+        health = await self.exchange.health_check()
+        if health['status'] != 'healthy':
+            logging.warning(f"Sàn không ổn định: {health['status']}")
+            await send_telegram_alert(f"Sàn không ổn định: {health['status']}")
+            return
+
+        if config.strategy_mode != 2:
+            await self.grid_manager.place_static_orders(self.current_price, self.exchange)
+        if config.strategy_mode == 2:
+            self.grid_manager.high_history.append(self.current_high)
+            self.grid_manager.low_history.append(self.current_low)
+        await self.grid_manager.calculate_adaptive_grid(self.current_price, self.exchange)
+        await self.grid_manager.place_grid_orders(self.current_price, self.exchange)
+        signals = await self.strategy.generate_signals(MarketData(price=self.current_price, high=self.current_high, low=self.current_low, volume=self.current_volume))
+        async with order_lock:
+            for signal in signals:
+                try:
+                    order = await self.exchange.place_order(signal.side, "LIMIT", signal.quantity, signal.price)
+                    if 'orderId' not in order:
+                        logging.error(f"Lệnh không trả về orderId: {order}")
+                        continue
+                    self.grid_manager.order_ids.append(order['orderId'])
+                except Exception as e:
+                    logging.error(f"Lỗi khi đặt lệnh: {signal.side} tại {signal.price}: {str(e)}")
+        await self.order_manager.check_and_handle_orders(self.current_price, self.exchange, self.tracker, self.grid_manager)
+        if config.trailing_stop_enabled:
+            await self.handle_trailing_stops()
+        await self.grid_manager.rebalance_if_needed(self.current_price, self.exchange)
+        logging.info(f"process_events chạy mất {time.time() - start_time:.2f}s")
+
+        usdt_balance, coin_balance = await safe_api_call(self.exchange.get_balance)
+        capital = usdt_balance + coin_balance * self.current_price
+        if capital < config.initial_investment * (config.stop_loss_capital_percent / 100):
+            message = f"Cảnh báo: Vốn giảm mạnh xuống còn {capital:.2f} USDT, dừng bot"
+            logging.error(f"Vốn giảm dưới {config.stop_loss_capital_percent}% ban đầu, dừng bot")
+            await send_telegram_alert(message)
+            sys.exit()
+
+        if config.telegram_enabled:
+            interval = config.telegram_report_interval
+            if len(self.protection.price_history) > 1:
+                first_price = self.protection.price_history[0]
+                price_change = abs(self.current_price - first_price) / first_price * 100
+                if price_change >= config.telegram_volatility_threshold:
+                    interval = config.telegram_volatile_interval
+            if current_time - self.last_report_time >= interval:
+                await self.send_hourly_report()
+
+    async def handle_trailing_stops(self):
+        to_remove = []
+        for (side, entry_price), data in self.grid_manager.trailing_stops.items():
+            if side.upper() != "BUY" or not isinstance(data, (list, tuple)) or len(data) < 2:
+                continue
+            highest_price, quantity = data[0], data[1]
+            if self.current_price > highest_price:
+                self.grid_manager.trailing_stops[(side, entry_price)][0] = self.current_price
+                highest_price = self.current_price
+            target_price = entry_price * (1 + config.base_take_profit_percent / 100)
+            if highest_price >= target_price:
+                stop_price = highest_price * (1 - config.base_stop_loss_percent / 100)
+                if self.current_price <= stop_price and self.current_price >= entry_price:
+                    sell_price = self.current_price
+                    base_asset = config.symbol.replace("USDT", "")
+                    if base_asset not in self.exchange.simulated_balance:
+                        self.exchange.simulated_balance[base_asset] = 0.0
+                    if self.exchange.simulated_balance[base_asset] < quantity:
+                        logging.warning(f"Số dư {base_asset} không đủ: {self.exchange.simulated_balance[base_asset]} < {quantity}")
+                    else:
+                        self.exchange.simulated_balance[base_asset] -= quantity
+                        proceeds = sell_price * quantity
+                        fee = proceeds * config.taker_fee
+                        self.exchange.simulated_balance["USDT"] += proceeds - fee
+                        profit = (sell_price - entry_price) * quantity
+                        self.tracker.record_trade(profit, fee)
+                        logging.info(f"Chốt lời: Bán {quantity:.6f} {base_asset} @ {sell_price:.2f}, lợi nhuận {profit:.2f}")
+
+class ExchangeInterface(ABC):
+    def __init__(self, name: str, api_key: str, api_secret: str):
+        self.exchange_name = name
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.websocket_connected = False
+
+    @abstractmethod
+    async def get_price(self) -> float:
+        pass
+
+    @abstractmethod
+    async def get_volume(self) -> float:
+        pass
+
+    @abstractmethod
+    async def place_order(self, side: str, order_type: str, quantity: float, price: float = None) -> Dict:
+        pass
+
+    @abstractmethod
+    async def cancel_order(self, order_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def get_open_orders(self) -> List[Dict]:
+        pass
+
+    @abstractmethod
+    async def get_all_orders(self) -> List[Dict]:
+        pass
+
+    @abstractmethod
+    async def get_balance(self) -> Tuple[float, float]:
+        pass
+
+    @abstractmethod
+    async def get_order_book(self) -> Dict:
+        pass
+
+    @abstractmethod
+    async def get_symbol_filters(self) -> Dict:
+        pass
+
+    async def health_check(self) -> Dict[str, Any]:
+        try:
+            start_time = time.time()
+            await self.get_price()
+            latency = (time.time() - start_time) * 1000
+            return {
+                'exchange': self.exchange_name,
+                'websocket': self.websocket_connected,
+                'api_latency_ms': latency,
+                'status': 'healthy'
+            }
+        except Exception as e:
+            return {
+                'exchange': self.exchange_name,
+                'websocket': self.websocket_connected,
+                'api_latency_ms': None,
+                'status': f'unhealthy: {str(e)}'
+            }
+
+    async def start_websocket(self) -> None:
+        logging.info(f"WebSocket không được hỗ trợ trong {self.exchange_name}")
+
+class PaperTradingExchange(ExchangeInterface):
+    def __init__(self, symbol: str):
+        super().__init__("paper_trading", "", "")
+        self.symbol = symbol
+        base_asset = symbol.replace("USDT", "")
+        self.simulated_balance = {"USDT": config.initial_investment, base_asset: 0.0}
+        self.paper_orders = []
+        self.current_market_price = 60000.0  # Giá BTC/USDT thực tế hơn
+        self.current_volume = 100.0
+        self.current_high = 60500.0
+        self.current_low = 59500.0
+        self.order_book = {"bids": [], "asks": []}
+        self.last_api_update = 0.0
+        self.api_update_interval = 10
+
+    async def get_price(self) -> float:
+        current_time = time.time()
+        if current_time - self.last_api_update < self.api_update_interval:
+            return self.current_market_price
+        mexc = ccxt_async.mexc()
+        try:
+            await mexc.load_markets()
+            symbol_str = self.symbol if "/" in self.symbol else self.symbol.replace("USDT", "/USDT")
+            ticker = await mexc.fetch_ticker(symbol_str)
+            price = float(ticker.get("last", ticker.get("close", 0.0)))
+            if price <= 0:
+                raise ValueError("Không lấy được giá từ API")
+            self.current_market_price = price
+            self.current_volume = float(ticker.get("quoteVolume", ticker.get("baseVolume", 0.0)))
+            self.current_high = float(ticker.get("high", ticker.get("highPrice", 0.0)))
+            self.current_low = float(ticker.get("low", ticker.get("lowPrice", 0.0)))
+            self.last_api_update = current_time
+            await self._update_order_book(price)
+            return price
+        except ccxt.NetworkError as e:
+            logging.error(f"Lỗi mạng khi lấy giá: {str(e)}")
+            return self.current_market_price
+        except ccxt.RateLimitExceeded as e:
+            logging.error(f"Đạt giới hạn tốc độ API MEXC: {str(e)}")
+            await asyncio.sleep(60)
+            return self.current_market_price
+        except Exception as e:
+            logging.error(f"Lỗi không xác định khi lấy giá: {str(e)}")
+            return self.current_market_price
+        finally:
+            try:
+                await mexc.close()
+            except Exception as e_close:
+                logging.error(f"Lỗi đóng kết nối MEXC: {str(e_close)}")
+
+    async def get_volume(self) -> float:
+        if time.time() - self.last_api_update < self.api_update_interval:
+            return self.current_volume
+        await self.get_price()
+        return self.current_volume
+
+    async def get_high_low(self) -> Tuple[float, float]:
+        if time.time() - self.last_api_update < self.api_update_interval:
+            return self.current_high, self.current_low
+        await self.get_price()
+        return self.current_high, self.current_low
+
+    async def _update_order_book(self, price: float):
+        mexc = ccxt_async.mexc()
+        try:
+            await mexc.load_markets()
+            symbol_str = self.symbol if "/" in self.symbol else self.symbol.replace("USDT", "/USDT")
+            order_book = await mexc.fetch_order_book(symbol_str, limit=10)
+            self.order_book = {
+                "bids": [[float(b[0]), float(b[1])] for b in order_book.get("bids", [])],
+                "asks": [[float(a[0]), float(a[1])] for a in order_book.get("asks", [])]
+            }
+        except Exception as e:
+            logging.error(f"Lỗi khi lấy order book: {str(e)}")
+            spread = price * 0.001
+            self.order_book = {
+                "bids": [[price - spread * (i + 1), 1] for i in range(5)],
+                "asks": [[price + spread * (i + 1), 1] for i in range(5)]
+            }
+        finally:
+            try:
+                await mexc.close()
+            except Exception as e_close:
+                logging.error(f"Lỗi đóng kết nối MEXC: {str(e_close)}")
+
+    async def place_order(self, side: str, order_type: str, quantity: float, price: float = None) -> Dict:
+        if order_type.upper() != "LIMIT" or price is None:
+            raise ValueError("Chỉ hỗ trợ LIMIT order trong paper trading")
+        order = {
+            "orderId": str(len(self.paper_orders) + 1),
+            "side": side.upper(),
+            "price": price,
+            "quantity": quantity,
+            "type": order_type.upper(),
+            "status": "OPEN",
+            "timestamp": time.time(),
+            "executedQty": 0.0
+        }
+        self.paper_orders.append(order)
+        logging.info(f"PaperTradingExchange.place_order: Đã thêm lệnh {order}")
+        return order
+
+    async def _match_orders(self):
+        price = await self.get_price()
+        await self._update_order_book(price)
+        base_asset = self.symbol.replace("USDT", "")
+        if base_asset not in self.simulated_balance:
+            self.simulated_balance[base_asset] = 0.0
+
+        for order in self.paper_orders:
+            if order["status"] != "OPEN":
+                continue
+            order_price = float(order["price"])
+            order_qty = float(order["quantity"])
+            if order["side"] == "BUY":
+                for ask_price, ask_qty in self.order_book["asks"]:
+                    if order_price >= ask_price and ask_qty >= order_qty:
+                        order["status"] = "FILLED"
+                        order["executedQty"] = order_qty
+                        cost = order_price * order_qty
+                        if self.simulated_balance["USDT"] < cost:
+                            order["status"] = "CANCELED"
+                            logging.warning(f"Hủy lệnh MUA: USDT không đủ {self.simulated_balance['USDT']} < {cost}")
+                            break
+                        self.simulated_balance["USDT"] -= cost
+                        self.simulated_balance[base_asset] += order_qty
+                        logging.info(f"Khớp lệnh MUA tại {order_price:.2f}, SL: {order_qty:.6f}")
+                        await send_telegram_alert(f"Khớp lệnh MUA tại {order_price:.2f}, SL: {order_qty:.6f}")
+                        break
+            elif order["side"] == "SELL":
+                for bid_price, bid_qty in self.order_book["bids"]:
+                    if order_price <= bid_price and bid_qty >= order_qty:
+                        order["status"] = "FILLED"
+                        order["executedQty"] = order_qty
+                        if self.simulated_balance[base_asset] < order_qty:
+                            order["status"] = "CANCELED"
+                            logging.warning(f"Hủy lệnh BÁN: {base_asset} không đủ {self.simulated_balance[base_asset]} < {order_qty}")
+                            break
+                        self.simulated_balance[base_asset] -= order_qty
+                        self.simulated_balance["USDT"] += order_price * order_qty
+                        logging.info(f"Khớp lệnh BÁN tại {order_price:.2f}, SL: {order_qty:.6f}")
+                        await send_telegram_alert(f"Khớp lệnh BÁN tại {order_price:.2f}, SL: {order_qty:.6f}")
+                        break
+
+    async def get_all_orders(self) -> List[Dict]:
+        await self._match_orders()
+        return self.paper_orders
+
+    async def get_open_orders(self) -> List[Dict]:
+        await self._match_orders()
+        return [o for o in self.paper_orders if o["status"] == "OPEN"]
+
+    async def cancel_order(self, order_id: str) -> None:
+        for order in self.paper_orders:
+            if str(order["orderId"]) == str(order_id) and order["status"] == "OPEN":
+                order["status"] = "CANCELED"
+                break
+
+    async def get_balance(self) -> Tuple[float, float]:
+        base_asset = self.symbol.replace("USDT", "")
+        if base_asset not in self.simulated_balance:
+            self.simulated_balance[base_asset] = 0.0
+        return self.simulated_balance["USDT"], self.simulated_balance[base_asset]
+
+    async def get_order_book(self) -> Dict:
+        await self.get_price()
+        return self.order_book
+
+    async def get_symbol_filters(self) -> Dict:
+        return {'minQty': 0.0001, 'maxQty': 1000, 'stepSize': 0.0001}
+
+    async def fetch_historical_data(self, timeframe: str, limit: int) -> pd.DataFrame:
+        binance = ccxt_async.binance({'enableRateLimit': True})
+        try:
+            ohlcv = await binance.fetch_ohlcv(self.symbol, timeframe=timeframe, limit=limit)
+            if not ohlcv or len(ohlcv) == 0:
+                logging.warning(f"Không có dữ liệu lịch sử cho {self.symbol}")
+                df = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            else:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).astype(float)
+                logging.info(f"Đã lấy {len(df)} dòng dữ liệu lịch sử cho {self.symbol}")
+        except Exception as e:
+            logging.error(f"Lỗi khi fetch dữ liệu lịch sử: {e}")
+            df = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        finally:
+            try:
+                await binance.close()
+            except Exception as e_close:
+                logging.error(f"Lỗi đóng kết nối Binance: {str(e_close)}")
+        return df
+
+    async def run_paper_trading_live(self, state: BotState, interval: float = 1.0):
+        last_ping_time = time.time()
+        while True:
+            try:
+                await state.process_events()
+                if time.time() - last_ping_time >= 600:
+                    logging.info("Bot vẫn đang chạy")
+                    last_ping_time = time.time()
+            except Exception as e:
+                logging.error(f"Lỗi trong vòng lặp chính: {str(e)}")
+            await asyncio.sleep(interval)
+
+# ======== QUẢN LÝ CÁC SÀN GIAO DỊCH ========
+class ExchangeManager:
+    def __init__(self):
+        self.exchanges: Dict[str, ExchangeInterface] = {}
+        self.exchanges["paper_trading"] = PaperTradingExchange(config.symbol)
+
+async def safe_api_call(func, *args, **kwargs):
+    try:
+        result = func(*args, **kwargs)
+        if hasattr(result, "__await__"):
+            return await result
+        return result
+    except Exception as e:
+        logging.error(f"API call error: {str(e)}")
+        raise
+
+async def rebalance_loop(state: BotState):
+    while True:
+        try:
+            await state.grid_manager.rebalance_if_needed(state.current_price, state.exchange)
+        except Exception as e:
+            logging.error(f"Lỗi rebalance: {str(e)}")
+        await asyncio.sleep(10)
+
+# ======== TELEGRAM ALERTS ========
+async def send_telegram_alert(message: str) -> None:
+    if not config.telegram_enabled:
+        return
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+        payload = {
+            "chat_id": config.telegram_chat_id,
+            "text": message
+        }
+        try:
+            async with session.post(url, json=payload) as response:
+                if response.status != 200:
+                    logging.error(f"Không thể gửi thông báo Telegram: {await response.text()}")
+        except Exception as e:
+            logging.error(f"Lỗi gửi thông báo Telegram: {str(e)}")
+
+async def check_protections(state: BotState, exchange: 'ExchangeInterface', price: float, volume: float, high: float, low: float) -> bool:
+    protection = state.protection
+    if await protection.check_circuit_breaker(price):
+        return True
+    if await protection.check_circuit_breaker_status():
+        return True
+    if protection.check_pump_protection(price):
+        logging.warning("Phát hiện pump, tạm dừng giao dịch")
+        await send_telegram_alert("Phát hiện pump, tạm dừng giao dịch")
+        return True
+    if protection.check_abnormal_activity(volume):
+        logging.warning("Phát hiện hoạt động bất thường, tạm dừng giao dịch")
+        await send_telegram_alert("Phát hiện hoạt động bất thường, tạm dừng giao dịch")
+        return True
+    should_stop, trailing_stop_price = protection.update_trailing_stop(price)
+    if should_stop:
+        logging.info(f"Trailing stop kích hoạt tại {trailing_stop_price}")
+        await state.order_manager.cancel_all_orders(exchange)
+        await send_telegram_alert(f"Trailing stop kích hoạt tại {trailing_stop_price}")
+        return True
+    return False
+
+def save_state(states: Dict[str, 'BotState']) -> None:
+    state_data = {}
+    for exchange_name, state in states.items():
+        state_data[exchange_name] = {
+            "profit_tracker": state.tracker.get_stats(),
+            "current_price": state.current_price,
+            "current_volume": state.current_volume,
+            "current_high": state.current_high,
+            "current_low": state.current_low,
+            "grid_manager": {
+                "grid_levels": state.grid_manager.grid_levels,
+                "static_orders_placed": state.grid_manager.static_orders_placed,
+                "order_ids": state.grid_manager.order_ids,
+                "static_order_ids": state.grid_manager.static_order_ids
+            }
+        }
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state_data, f)
+    logging.info("Đã lưu trạng thái bot")
+
+def load_state(states: Dict[str, 'BotState']) -> None:
+    if not os.path.exists(STATE_FILE):
+        logging.info("Không tìm thấy file trạng thái, khởi tạo trạng thái mới")
+        return
+    try:
+        with open(STATE_FILE, 'r') as f:
+            state_data = json.load(f)
+        for exchange_name, state in states.items():
+            if exchange_name in state_data:
+                data = state_data[exchange_name]
+                state.tracker.total_profit = data["profit_tracker"]["total_profit"]
+                state.tracker.trade_count = data["profit_tracker"]["trade_count"]
+                state.current_price = data["current_price"]
+                state.current_volume = data["current_volume"]
+                state.current_high = data["current_high"]
+                state.current_low = data["current_low"]
+                state.grid_manager.grid_levels = [(float(l), float(h)) for l, h in data["grid_manager"]["grid_levels"]]
+                state.grid_manager.static_orders_placed = data["grid_manager"]["static_orders_placed"]
+                state.grid_manager.order_ids = data["grid_manager"]["order_ids"]
+                state.grid_manager.static_order_ids = data["grid_manager"]["static_order_ids"]
+        logging.info("Đã tải trạng thái bot từ file")
+    except Exception as e:
+        logging.error(f"Lỗi khi tải trạng thái: {str(e)}")
+        logging.info("Khởi tạo trạng thái mới do lỗi")
+
+async def send_hourly_report(self):
+    stats = self.tracker.get_stats()
+    usdt_balance, coin_balance = await safe_api_call(self.exchange.get_balance)
+    total_capital = usdt_balance + coin_balance * self.current_price
+    message = (
+        f"Báo cáo hàng giờ:\n"
+        f"Thời gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Giá hiện tại: {self.current_price:.2f} USDT\n"
+        f"Tổng lợi nhuận: {stats['total_profit']:.2f} USDT\n"
+        f"Số giao dịch: {stats['trade_count']}\n"
+        f"Tổng vốn: {total_capital:.2f} USDT\n"
+        f"Số dư USDT: {usdt_balance:.2f}\n"
+        f"Số dư {config.symbol.replace('USDT', '')}: {coin_balance:.6f}"
+    )
+    await send_telegram_alert(message)
+    self.last_report_time = time.time()
+    logging.info("Đã gửi báo cáo hàng giờ qua Telegram")
+
+# ======== MAIN ========
+if __name__ == "__main__":
+    async def main():
+        config.paper_trading_enabled = True
+        exchange = PaperTradingExchange(config.symbol)
+        grid_manager = EnhancedSmartGridManager()
+        strategy = AdaptiveGridStrategy(grid_manager) if config.strategy_mode == 1 else DenseGridStrategy(grid_manager)
+        state = BotState(exchange, strategy)
+
+        if config.backtest_enabled:
+            logging.info("Bắt đầu chạy chế độ Backtest")
+            df = await exchange.fetch_historical_data(config.backtest_timeframe, config.backtest_limit)
+            for idx, data in df.iterrows():
+                price = float(data['close'])
+                high = float(data['high'])
+                low = float(data['low'])
+                volume = float(data['volume'])
+                state.current_price = price
+                state.current_high = high
+                state.current_low = low
+                state.current_volume = volume
+
+                state.protection.update(price, high, low, volume)
+                if await check_protections(state, exchange, price, volume, high, low):
+                    continue
+                if config.strategy_mode != 2:
+                    await state.grid_manager.place_static_orders(price, exchange)
+                if config.strategy_mode == 2:
+                    state.grid_manager.high_history.append(high)
+                    state.grid_manager.low_history.append(low)
+                await state.grid_manager.calculate_adaptive_grid(price, exchange)
+                await state.grid_manager.place_grid_orders(price, exchange)
+                signals = await state.strategy.generate_signals(MarketData(price=price, high=high, low=low, volume=volume))
+                for signal in signals:
+                    order = await exchange.place_order(signal.side, "LIMIT", signal.quantity, signal.price)
+                    if 'orderId' in order:
+                        state.grid_manager.order_ids.append(order['orderId'])
+                await state.order_manager.check_and_handle_orders(price, exchange, state.tracker, state.grid_manager)
+                if config.trailing_stop_enabled:
+                    await state.handle_trailing_stops()
+                await state.grid_manager.rebalance_if_needed(price, exchange)
+            stats = state.tracker.get_stats()
+            logging.info(f"Backtest hoàn tất: {stats}")
+            return
+
+        logging.info("Hủy tất cả lệnh mở trước khi khởi động bot")
+        await state.order_manager.cancel_all_orders(exchange)
+        await grid_manager.cancel_all_orders(exchange, preserve_static=False)
+
+        states = {exchange.exchange_name: state}
+        load_state(states)
+        await asyncio.gather(
+            exchange.run_paper_trading_live(state, interval=1),
+            rebalance_loop(state)
+        )
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot đã dừng lại bởi người dùng")
